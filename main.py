@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
@@ -18,6 +18,7 @@ app.add_middleware(
 )
 
 @app.get("/")
+@app.head("/")
 def read_root():
     return {
         "status": "ok",
@@ -29,6 +30,9 @@ def read_root():
 def ping():
     return {"ping": "pong"}
 
+@app.head("/ping")
+def ping():
+    return Response(status_code=200)
 
 def get_futures(root: str) -> pd.DataFrame:
     root = root.strip().upper()
