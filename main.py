@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
+from datetime import timezone, timedelta
 
 import requests
 from urllib.parse import unquote
@@ -110,6 +111,63 @@ def get_futures(root: str) -> pd.DataFrame:
     return df[cols]
 
 
+
+INVESTING_HTML = "https://br.investing.com/currencies/usd-brl"
+INVESTING_API  = "https://api.investing.com/api/financialdata/650/real-time"
+AWESOME_API    = "https://economia.awesomeapi.com.br/json/all"
+
+HEADERS_INVESTING = {
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+def fetch_dolar_investing():
+    session = requests.Session()
+
+    # 1️⃣ Primeira chamada só pra pegar cookies
+    session.get(INVESTING_HTML, headers=HEADERS_INVESTING, timeout=10)
+
+    # 2️⃣ Chamada à API interna
+    r = session.get(
+        INVESTING_API,
+        headers={
+            **HEADERS_INVESTING,
+            "accept": "application/json",
+            "referer": INVESTING_HTML,
+            "x-requested-with": "XMLHttpRequest",
+            "domain-id": "30",
+        },
+        timeout=10
+    )
+
+    r.raise_for_status()
+    data = r.json()
+
+    price = float(data["last"].replace(",", "."))
+    ts = datetime.fromtimestamp(
+        int(data["lastUpdateTimestamp"]),
+        tz=timezone.utc
+    )
+
+    return price, ts
+
+def fetch_dolar_awesome():
+    r = requests.get(AWESOME_API, timeout=10)
+    r.raise_for_status()
+
+    usd = r.json()["USD"]
+    price = float(usd["bid"])
+
+    ts = datetime.fromisoformat(
+        usd["create_date"].replace(" ", "T")
+    ).replace(tzinfo=timezone.utc)
+
+    return price, ts
+
+
 @app.get("/futures")
 def read_futures(roots: str = "CC,SB"):
     """
@@ -129,3 +187,29 @@ def read_futures(roots: str = "CC,SB"):
         "rows": len(df_final),
         "data": df_final.to_dict(orient="records"),
     }
+
+@app.get("/dolar")
+def read_dolar():
+    try:
+        price, ts = fetch_dolar_investing()
+
+        # se estiver atualizado (≤ 10 minutos)
+        if datetime.now(timezone.utc) - ts <= timedelta(minutes=10):
+            return {
+                "source": "investing",
+                "price": price,
+                "datetime": ts.isoformat()
+            }
+
+    except Exception as e:
+        # log simples (Render mostra no console)
+        print("Investing falhou:", e)
+
+    # fallback
+    price, ts = fetch_dolar_awesome()
+    return {
+        "source": "awesomeapi",
+        "price": price,
+        "datetime": ts.isoformat()
+    }
+
