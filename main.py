@@ -2,6 +2,7 @@ from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from datetime import timezone, timedelta
+from fastapi import HTTPException
 
 import requests
 from urllib.parse import unquote
@@ -199,10 +200,10 @@ def read_futures(roots: str = "CC,SB"):
 
 @app.get("/dolar")
 def read_dolar():
+    # 1️⃣ tenta Investing
     try:
         price, ts = fetch_dolar_investing()
 
-        # se estiver atualizado (≤ 10 minutos)
         if datetime.now(timezone.utc) - ts <= timedelta(minutes=10):
             return {
                 "source": "investing",
@@ -211,15 +212,22 @@ def read_dolar():
             }
 
     except Exception as e:
-        # log simples (Render mostra no console)
         print("Investing falhou:", e)
 
-    # fallback
-    price, ts = fetch_dolar_awesome()
-    return {
-        "source": "awesomeapi",
-        "price": price,
-        "datetime": ts.isoformat()
-    }
+    # 2️⃣ tenta Awesome
+    try:
+        price, ts = fetch_dolar_awesome()
+        return {
+            "source": "awesomeapi",
+            "price": price,
+            "datetime": ts.isoformat()
+        }
 
+    except Exception as e:
+        print("AwesomeAPI falhou:", e)
 
+    # 3️⃣ se TUDO falhar → erro controlado
+    raise HTTPException(
+        status_code=503,
+        detail="Não foi possível obter cotação do dólar no momento"
+    )
