@@ -127,10 +127,8 @@ HEADERS_INVESTING = {
 def fetch_dolar_investing():
     session = requests.Session()
 
-    # 1️⃣ Primeira chamada só pra pegar cookies
     session.get(INVESTING_HTML, headers=HEADERS_INVESTING, timeout=10)
 
-    # 2️⃣ Chamada à API interna
     r = session.get(
         INVESTING_API,
         headers={
@@ -143,8 +141,19 @@ def fetch_dolar_investing():
         timeout=10
     )
 
-    r.raise_for_status()
-    data = r.json()
+    # se não for 200, falha controlada
+    if r.status_code != 200:
+        raise RuntimeError(f"Investing HTTP {r.status_code}")
+
+    # tenta JSON
+    try:
+        data = r.json()
+    except Exception:
+        raise RuntimeError("Investing retornou resposta não-JSON")
+
+    # valida estrutura
+    if "last" not in data or "lastUpdateTimestamp" not in data:
+        raise RuntimeError(f"Estrutura inesperada: {data}")
 
     price = float(data["last"].replace(",", "."))
     ts = datetime.fromtimestamp(
@@ -212,4 +221,5 @@ def read_dolar():
         "price": price,
         "datetime": ts.isoformat()
     }
+
 
