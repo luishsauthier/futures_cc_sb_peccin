@@ -214,7 +214,7 @@ def read_dolar():
     except Exception as e:
         print("Investing falhou:", e)
 
-    # 2️⃣ tenta Awesome
+    # 2️⃣ tenta AwesomeAPI
     try:
         price, ts = fetch_dolar_awesome()
         return {
@@ -226,8 +226,8 @@ def read_dolar():
     except Exception as e:
         print("AwesomeAPI falhou:", e)
 
-    # 3️⃣ se TUDO falhar → erro controlado
+    # 3️⃣ tudo falhou → erro controlado
     raise HTTPException(
         status_code=503,
-        detail="Não foi possível obter cotação do dólar no momento"
+        detail="Não foi possível obter a cotação do dólar no momento"
     )
