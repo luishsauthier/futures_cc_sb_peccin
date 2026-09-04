@@ -1,10 +1,11 @@
 import logging
 import re
+import time
 from datetime import datetime, timezone
-from urllib.parse import unquote
 
 import pandas as pd
 import requests
+import yfinance as yf
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
