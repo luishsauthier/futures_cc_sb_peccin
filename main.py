@@ -48,174 +48,134 @@ def ping_head():
     return Response(status_code=200)
 
 
+YAHOO_SYMBOLS = {
+    "CC": "CC=F",
+    "SB": "SB=F",
+}
+
+
+def number_or_none(value):
+    if value is None or pd.isna(value):
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def integer_or_none(value):
+    if value is None or pd.isna(value):
+        return None
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def get_futures(root: str) -> pd.DataFrame:
     root = root.strip().upper()
 
-    base_url = (
-        f"https://www.barchart.com/"
-        f"futures/quotes/{root}*0/futures-prices"
-    )
+    yahoo_symbol = YAHOO_SYMBOLS.get(root)
 
-    api_url = (
-        "https://www.barchart.com/"
-        "proxies/core-api/v1/quotes/get"
-    )
+    if not yahoo_symbol:
+        raise RuntimeError(
+            f"O root {root} não está configurado no Yahoo Finance"
+        )
 
-    get_headers = {
-        "accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/webp,*/*;q=0.8"
-        ),
-        "accept-language": "en-US,en;q=0.9",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+    history = None
+    last_error = None
+
+    # Faz até três tentativas porque o Yahoo pode limitar
+    # temporariamente requisições vindas de servidores em nuvem.
+    for attempt in range(3):
+        try:
+            ticker = yf.Ticker(yahoo_symbol)
+
+            history = ticker.history(
+                period="1mo",
+                interval="1d",
+                auto_adjust=False,
+                actions=False,
+            )
+
+            if history is not None and not history.empty:
+                break
+
+            last_error = RuntimeError(
+                f"Yahoo Finance retornou histórico vazio para {root}"
+            )
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "Tentativa %s falhou para root=%s: %s",
+                attempt + 1,
+                root,
+                exc,
+            )
+
+        if attempt < 2:
+            time.sleep(2 ** attempt)
+
+    if history is None or history.empty:
+        raise RuntimeError(
+            f"Falha ao consultar Yahoo Finance para {root}: "
+            f"{last_error}"
+        )
+
+    if "Close" not in history.columns:
+        raise RuntimeError(
+            f"Yahoo Finance não retornou a coluna Close para {root}"
+        )
+
+    history = history.dropna(subset=["Close"])
+
+    if history.empty:
+        raise RuntimeError(
+            f"Yahoo Finance não retornou preços válidos para {root}"
+        )
+
+    current_row = history.iloc[-1]
+    current_index = history.index[-1]
+
+    previous_close = None
+
+    if len(history) >= 2:
+        previous_close = number_or_none(
+            history.iloc[-2].get("Close")
+        )
+
+    last_price = number_or_none(current_row.get("Close"))
+
+    change = None
+
+    if last_price is not None and previous_close is not None:
+        change = last_price - previous_close
+
+    try:
+        trade_time = current_index.isoformat()
+    except AttributeError:
+        trade_time = str(current_index)
+
+    row = {
+        "Root": root,
+        "Contract": yahoo_symbol,
+        "Last": last_price,
+        "Change": change,
+        "Open": number_or_none(current_row.get("Open")),
+        "High": number_or_none(current_row.get("High")),
+        "Low": number_or_none(current_row.get("Low")),
+        "Previous": previous_close,
+        "Volume": integer_or_none(current_row.get("Volume")),
+
+        # Yahoo Finance não fornece esse campo
+        # nesse histórico de contrato contínuo.
+        "Open_Int": None,
+
+        "Time": trade_time,
     }
-
-    with requests.Session() as session:
-        try:
-            landing_response = session.get(
-                base_url,
-                headers=get_headers,
-                timeout=(5, 20),
-            )
-
-            landing_response.raise_for_status()
-
-        except requests.Timeout as exc:
-            raise RuntimeError(
-                f"Timeout ao acessar o Barchart para o root {root}"
-            ) from exc
-
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Falha HTTP ao acessar o Barchart para {root}: {exc}"
-            ) from exc
-
-        cookies = session.cookies.get_dict()
-        token = cookies.get("XSRF-TOKEN")
-
-        if not token:
-            body_lower = landing_response.text.lower()
-
-            anti_bot_detected = (
-                "verify that you're not a robot" in body_lower
-                or "enable javascript" in body_lower
-                or "javascript is disabled" in body_lower
-            )
-
-            if anti_bot_detected:
-                reason = "proteção anti-bot/JavaScript detectada"
-            else:
-                reason = "cookie XSRF-TOKEN não retornado"
-
-            raise RuntimeError(
-                f"Barchart indisponível para coleta: {reason}; "
-                f"root={root}; HTTP={landing_response.status_code}"
-            )
-
-        xsrf_token = unquote(unquote(token))
-
-        api_headers = {
-            "accept": "application/json, text/plain, */*",
-            "referer": base_url,
-            "user-agent": get_headers["user-agent"],
-            "x-xsrf-token": xsrf_token,
-        }
-
-        payload = {
-            "fields": (
-                "symbol,contractSymbol,lastPrice,priceChange,"
-                "openPrice,highPrice,lowPrice,previousPrice,"
-                "volume,openInterest,tradeTime"
-            ),
-            "list": "futures.contractInRoot",
-            "root": root,
-            "raw": "1",
-        }
-
-        try:
-            quote_response = session.get(
-                api_url,
-                params=payload,
-                headers=api_headers,
-                timeout=(5, 20),
-            )
-
-            quote_response.raise_for_status()
-
-        except requests.Timeout as exc:
-            raise RuntimeError(
-                f"Timeout ao consultar os contratos do root {root}"
-            ) from exc
-
-        except requests.RequestException as exc:
-            status = getattr(exc.response, "status_code", None)
-
-            raise RuntimeError(
-                f"Falha na consulta do Barchart para {root}; "
-                f"HTTP={status}; erro={exc}"
-            ) from exc
-
-        try:
-            body = quote_response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Barchart retornou conteúdo não JSON para {root}"
-            ) from exc
-
-    data = body.get("data", [])
-
-    if not data:
-        raise RuntimeError(
-            f"Nenhum contrato foi retornado para o root {root}"
-        )
-
-    required_columns = [
-        "contractSymbol",
-        "lastPrice",
-        "priceChange",
-        "openPrice",
-        "highPrice",
-        "lowPrice",
-        "previousPrice",
-        "volume",
-        "openInterest",
-        "tradeTime",
-    ]
-
-    df = pd.DataFrame(data)
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-        raise RuntimeError(
-            "O formato retornado pelo Barchart mudou. "
-            f"Colunas ausentes: {missing_columns}"
-        )
-
-    df = df[required_columns].rename(
-        columns={
-            "contractSymbol": "Contract",
-            "lastPrice": "Last",
-            "priceChange": "Change",
-            "openPrice": "Open",
-            "highPrice": "High",
-            "lowPrice": "Low",
-            "previousPrice": "Previous",
-            "volume": "Volume",
-            "openInterest": "Open_Int",
-            "tradeTime": "Time",
-        }
-    )
-
-    df["Root"] = root
 
     output_columns = [
         "Root",
@@ -231,7 +191,10 @@ def get_futures(root: str) -> pd.DataFrame:
         "Time",
     ]
 
-    return df[output_columns]
+    return pd.DataFrame(
+        [row],
+        columns=output_columns,
+    )
 
 
 @api.get("/futures")
@@ -297,7 +260,7 @@ def read_futures(roots: str = "CC,SB"):
             status_code=502,
             detail={
                 "message": "Falha ao consultar a fonte de contratos futuros",
-                "source": "Barchart",
+                "source": "Yahoo Finance",
                 "errors": errors,
             },
         )
