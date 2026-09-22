@@ -1,8 +1,15 @@
 services:
   - type: web
     name: futures_cc_sb_peccin
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    runtime: python
     plan: free
     region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /ping
+    envVars:
+      - key: BARCHART_API_KEY
+        sync: false
+
+      - key: CACHE_TTL_SECONDS
+        value: "60"
