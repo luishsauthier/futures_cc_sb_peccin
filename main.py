@@ -19,9 +19,17 @@ logging.basicConfig(
 logger = logging.getLogger("futures-api")
 
 
-BARCHART_URL = "https://ondemand.websol.barchart.com/getQuote.json"
+DEFAULT_BARCHART_URL = (
+    "https://ondemand.websol.barchart.com/getQuote.json"
+)
+BARCHART_URL = (
+    os.getenv("BARCHART_API_URL", DEFAULT_BARCHART_URL).strip()
+    or DEFAULT_BARCHART_URL
+)
+
 REQUEST_TIMEOUT = (5, 30)
 MAX_ATTEMPTS = 3
+MAX_ROOTS_PER_REQUEST = 10
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
@@ -42,7 +50,26 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(value, minimum)
 
 
-CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 60)
+def env_list(name: str, default: str) -> tuple[str, ...]:
+    raw_value = os.getenv(name, default)
+    values = [
+        item.strip().upper()
+        for item in raw_value.split(",")
+        if item.strip()
+    ]
+
+    # Remove duplicados preservando a ordem.
+    return tuple(dict.fromkeys(values))
+
+
+# Usa o novo nome, mas preserva compatibilidade com a variável antiga.
+LEGACY_CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 60)
+CACHE_TTL_SECONDS = env_int(
+    "BARCHART_CACHE_TTL_SECONDS",
+    LEGACY_CACHE_TTL_SECONDS,
+)
+SUPPORTED_ROOTS = env_list("SUPPORTED_ROOTS", "CC,SB")
+
 
 # Cache simples em memória.
 # Se houver mais de uma instância no Render, cada instância terá seu cache.
@@ -52,20 +79,59 @@ _cache_lock = threading.Lock()
 
 api = FastAPI(
     title="Futures API",
-    version="3.0.0",
+    version="3.1.0",
 )
+
+
+def get_api_key() -> str:
+    return os.getenv("BARCHART_API_KEY", "").strip()
+
+
+def source_unavailable_exception() -> HTTPException:
+    """
+    Resposta temporária e amigável enquanto a chave oficial não foi liberada.
+
+    Mantemos HTTP 503 para o frontend diferenciar indisponibilidade da fonte
+    de uma resposta válida sem cotações.
+    """
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "FUTURES_SOURCE_UNAVAILABLE",
+            "message": (
+                "Atualização de preços temporariamente indisponível."
+            ),
+            "description": (
+                "Estamos aguardando a liberação de acesso à fonte oficial "
+                "Barchart. Nenhum valor alternativo será exibido para "
+                "evitar divergências."
+            ),
+            "source": "Barchart OnDemand",
+            "temporary": True,
+            "retryable": False,
+        },
+        headers={
+            "Retry-After": "3600",
+        },
+    )
 
 
 @api.get("/")
 def read_root():
+    api_key_configured = bool(get_api_key())
+
     return {
         "status": "ok",
         "message": "API de futures está online",
         "source": "Barchart OnDemand",
-        "apiKeyConfigured": bool(
-            os.getenv("BARCHART_API_KEY", "").strip()
+        "sourceStatus": (
+            "ready"
+            if api_key_configured
+            else "awaiting_credentials"
         ),
+        "apiKeyConfigured": api_key_configured,
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        "supportedRoots": list(SUPPORTED_ROOTS),
         "endpoints": [
             "/ping",
             "/futures?roots=CC,SB",
@@ -89,12 +155,14 @@ def ping_head():
     return Response(status_code=200)
 
 
-def get_api_key() -> str:
-    return os.getenv("BARCHART_API_KEY", "").strip()
-
-
 def number_or_none(value: Any) -> float | None:
-    if value is None or pd.isna(value):
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
         return None
 
     try:
@@ -104,7 +172,13 @@ def number_or_none(value: Any) -> float | None:
 
 
 def integer_or_none(value: Any) -> int | None:
-    if value is None or pd.isna(value):
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
         return None
 
     try:
@@ -115,8 +189,16 @@ def integer_or_none(value: Any) -> int | None:
 
 def first_not_none(*values: Any) -> Any:
     for value in values:
-        if value is not None and not pd.isna(value):
-            return value
+        if value is None:
+            continue
+
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        return value
 
     return None
 
@@ -179,23 +261,24 @@ def request_barchart(root: str) -> dict[str, Any]:
     api_key = get_api_key()
 
     if not api_key:
+        # Proteção adicional para chamadas internas diretas.
+        # A rota /futures trata este caso antes de iniciar as consultas.
         raise RuntimeError(
-            "A variável BARCHART_API_KEY não está configurada no Render"
+            "Fonte Barchart ainda não configurada"
         )
 
     payload = {
         "apikey": api_key,
-
         # ^F solicita todos os contratos futuros do root.
         # Exemplos: CC^F e SB^F.
         "symbols": f"{root}^F",
-
-        # Campo adicional de interesse em aberto.
-        "fields": "openInterest",
+        # Campos adicionais de interesse.
+        "fields": "openInterest,previousClose",
     }
 
     response: requests.Response | None = None
     last_error: Exception | None = None
+    started_at = time.monotonic()
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -204,7 +287,10 @@ def request_barchart(root: str) -> dict[str, Any]:
                 data=payload,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "futures-cc-sb-peccin/3.0",
+                    "Content-Type": (
+                        "application/x-www-form-urlencoded"
+                    ),
+                    "User-Agent": "futures-cc-sb-peccin/3.1",
                 },
                 timeout=REQUEST_TIMEOUT,
             )
@@ -221,7 +307,6 @@ def request_barchart(root: str) -> dict[str, Any]:
                     attempt,
                     MAX_ATTEMPTS,
                 )
-
                 time.sleep(2 ** (attempt - 1))
                 continue
 
@@ -238,7 +323,6 @@ def request_barchart(root: str) -> dict[str, Any]:
                     attempt,
                     MAX_ATTEMPTS,
                 )
-
                 time.sleep(2 ** (attempt - 1))
                 continue
 
@@ -258,46 +342,81 @@ def request_barchart(root: str) -> dict[str, Any]:
                     MAX_ATTEMPTS,
                     exc,
                 )
-
                 time.sleep(2 ** (attempt - 1))
                 continue
 
             raise RuntimeError(
-                f"Falha de rede ao consultar o Barchart para "
+                "Falha de rede ao consultar o Barchart para "
                 f"{root}: {exc}"
             ) from exc
 
     if response is None:
         raise RuntimeError(
-            f"Não foi possível obter resposta do Barchart para "
+            "Não foi possível obter resposta do Barchart para "
             f"{root}: {last_error}"
         )
 
     try:
         body = response.json()
     except ValueError as exc:
-        preview = response.text[:200].replace("\n", " ")
-
+        logger.error(
+            "Barchart retornou resposta não JSON; root=%s; HTTP=%s",
+            root,
+            response.status_code,
+        )
         raise RuntimeError(
             "Barchart retornou conteúdo que não é JSON; "
-            f"root={root}; HTTP={response.status_code}; "
-            f"resposta={preview!r}"
+            f"root={root}; HTTP={response.status_code}"
         ) from exc
 
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            "Barchart retornou um formato de resposta inesperado; "
+            f"root={root}; HTTP={response.status_code}"
+        )
+
     api_status = body.get("status") or {}
+
+    if not isinstance(api_status, dict):
+        api_status = {}
+
     api_code = api_status.get("code")
     api_message = api_status.get(
         "message",
         "Mensagem não informada",
     )
+    results = body.get("results") or []
 
-    if response.status_code >= 400 or str(api_code) != "200":
+    elapsed_ms = round(
+        (time.monotonic() - started_at) * 1000
+    )
+
+    logger.info(
+        "Consulta Barchart concluída; root=%s; HTTP=%s; "
+        "apiCode=%s; contratos=%s; elapsedMs=%s",
+        root,
+        response.status_code,
+        api_code,
+        len(results) if isinstance(results, list) else 0,
+        elapsed_ms,
+    )
+
+    http_success = 200 <= response.status_code < 300
+    api_success = str(api_code) == "200"
+
+    if not http_success or not api_success:
         raise RuntimeError(
             "Barchart recusou a consulta; "
             f"root={root}; "
             f"HTTP={response.status_code}; "
             f"código={api_code}; "
             f"mensagem={api_message}"
+        )
+
+    if not isinstance(results, list):
+        raise RuntimeError(
+            "Barchart retornou results em formato inesperado; "
+            f"root={root}"
         )
 
     return body
@@ -317,7 +436,6 @@ def get_futures(
                 "Cache utilizado para root=%s",
                 root,
             )
-
             return cached
 
     body = request_barchart(root)
@@ -325,12 +443,20 @@ def get_futures(
 
     if not results:
         raise RuntimeError(
-            f"Nenhum contrato futuro foi retornado para o root {root}"
+            "Nenhum contrato futuro foi retornado para "
+            f"o root {root}"
         )
 
     rows: list[dict[str, Any]] = []
 
     for item in results:
+        if not isinstance(item, dict):
+            logger.warning(
+                "Registro ignorado por formato inválido; root=%s",
+                root,
+            )
+            continue
+
         contract = item.get("symbol")
 
         if not contract:
@@ -343,8 +469,6 @@ def get_futures(
         last_price = item.get("lastPrice")
         net_change = item.get("netChange")
 
-        # Algumas respostas podem devolver openInterest.
-        # Outras podem devolver previousOpenInterest.
         open_interest = first_not_none(
             item.get("openInterest"),
             item.get("previousOpenInterest"),
@@ -362,7 +486,9 @@ def get_futures(
                 "Previous": calculate_previous_price(
                     last_price=last_price,
                     net_change=net_change,
-                    explicit_previous=item.get("previousClose"),
+                    explicit_previous=item.get(
+                        "previousClose"
+                    ),
                 ),
                 "Volume": integer_or_none(
                     item.get("volume")
@@ -410,6 +536,21 @@ def get_futures(
     return dataframe.copy(deep=True)
 
 
+def normalize_dataframe(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    normalized = dataframe.replace(
+        [float("inf"), float("-inf")],
+        pd.NA,
+    )
+
+    return (
+        normalized
+        .astype(object)
+        .where(pd.notna(normalized), None)
+    )
+
+
 @api.get("/futures")
 def read_futures(
     roots: str = "CC,SB",
@@ -427,16 +568,25 @@ def read_futures(
     if not root_list:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Informe pelo menos um root, "
-                "por exemplo: CC,SB"
-            ),
+            detail={
+                "code": "INVALID_ROOTS",
+                "message": (
+                    "Informe pelo menos um root, "
+                    "por exemplo: CC,SB"
+                ),
+            },
         )
 
-    if len(root_list) > 10:
+    if len(root_list) > MAX_ROOTS_PER_REQUEST:
         raise HTTPException(
             status_code=400,
-            detail="O limite é de 10 roots por requisição",
+            detail={
+                "code": "ROOT_LIMIT_EXCEEDED",
+                "message": (
+                    "O limite e de "
+                    f"{MAX_ROOTS_PER_REQUEST} roots por requisição"
+                ),
+            },
         )
 
     invalid_roots = [
@@ -449,20 +599,44 @@ def read_futures(
         raise HTTPException(
             status_code=400,
             detail={
+                "code": "INVALID_ROOTS",
                 "message": "Foram informados roots inválidos",
                 "roots": invalid_roots,
             },
         )
 
-    if not get_api_key():
+    unsupported_roots = [
+        root
+        for root in root_list
+        if root not in SUPPORTED_ROOTS
+    ]
+
+    if unsupported_roots:
         raise HTTPException(
-            status_code=503,
+            status_code=400,
             detail={
-                "message": "A API está sem a chave do Barchart",
-                "source": "Barchart OnDemand",
-                "configuration": "BARCHART_API_KEY",
+                "code": "UNSUPPORTED_ROOTS",
+                "message": "Foram informados roots não suportados",
+                "roots": unsupported_roots,
+                "supportedRoots": list(SUPPORTED_ROOTS),
             },
         )
+
+    # Esta verificação precisa ocorrer antes do loop.
+    # Assim o 503 amigável não é capturado e transformado em 502.
+    if not get_api_key():
+        logger.info(
+            "Consulta de futures bloqueada temporariamente: "
+            "BARCHART_API_KEY ainda não configurada; roots=%s",
+            ",".join(root_list),
+        )
+        raise source_unavailable_exception()
+
+    logger.info(
+        "Consulta de futures iniciada; roots=%s; refresh=%s",
+        ",".join(root_list),
+        refresh,
+    )
 
     frames: list[pd.DataFrame] = []
     errors: list[dict[str, str]] = []
@@ -493,6 +667,7 @@ def read_futures(
         raise HTTPException(
             status_code=502,
             detail={
+                "code": "FUTURES_PROVIDER_ERROR",
                 "message": (
                     "Falha ao consultar a fonte "
                     "de contratos futuros"
@@ -506,18 +681,7 @@ def read_futures(
         frames,
         ignore_index=True,
     )
-
-    # Remove valores que não podem ser serializados em JSON.
-    df_final = df_final.replace(
-        [float("inf"), float("-inf")],
-        pd.NA,
-    )
-
-    df_final = (
-        df_final
-        .astype(object)
-        .where(pd.notna(df_final), None)
-    )
+    df_final = normalize_dataframe(df_final)
 
     return {
         "timestamp": datetime.now(
