@@ -1,3 +1,4 @@
+import hmac
 import logging
 import os
 import re
@@ -5,10 +6,11 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -19,18 +21,30 @@ logging.basicConfig(
 logger = logging.getLogger("futures-api")
 
 
-DEFAULT_BARCHART_URL = (
-    "https://ondemand.websol.barchart.com/getQuote.json"
+BARCHART_API_URL = os.getenv(
+    "BARCHART_API_URL",
+    "https://ondemand.websol.barchart.com/getQuote.json",
+).strip()
+
+LEGACY_BARCHART_PAGE_URL = (
+    "https://www.barchart.com/"
+    "futures/quotes/{root}%2A0/futures-prices"
 )
-BARCHART_URL = (
-    os.getenv("BARCHART_API_URL", DEFAULT_BARCHART_URL).strip()
-    or DEFAULT_BARCHART_URL
+
+LEGACY_BARCHART_PROXY_URL = (
+    "https://www.barchart.com/"
+    "proxies/core-api/v1/quotes/get"
 )
 
 REQUEST_TIMEOUT = (5, 30)
+LEGACY_REQUEST_TIMEOUT = (5, 20)
 MAX_ATTEMPTS = 3
-MAX_ROOTS_PER_REQUEST = 10
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+# -----------------------------------------------------------------------------
+# Configuracao
+# -----------------------------------------------------------------------------
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -40,7 +54,7 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
         value = int(raw_value)
     except ValueError:
         logger.warning(
-            "Valor inválido para %s=%r; usando %s",
+            "Valor invalido para %s=%r; usando %s",
             name,
             raw_value,
             default,
@@ -50,32 +64,60 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(value, minimum)
 
 
-def env_list(name: str, default: str) -> tuple[str, ...]:
-    raw_value = os.getenv(name, default)
-    values = [
-        item.strip().upper()
-        for item in raw_value.split(",")
-        if item.strip()
+def env_bool(name: str, default: bool = False) -> bool:
+    raw_value = os.getenv(
+        name,
+        "true" if default else "false",
+    )
+
+    return raw_value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def parse_supported_roots() -> tuple[str, ...]:
+    raw_value = os.getenv("SUPPORTED_ROOTS", "CC,SB")
+
+    roots = [
+        root.strip().upper()
+        for root in raw_value.split(",")
+        if root.strip()
     ]
 
-    # Remove duplicados preservando a ordem.
-    return tuple(dict.fromkeys(values))
+    valid_roots = [
+        root
+        for root in roots
+        if re.fullmatch(r"[A-Z0-9]{1,8}", root)
+    ]
+
+    if not valid_roots:
+        logger.warning(
+            "SUPPORTED_ROOTS nao possui valores validos; usando CC,SB"
+        )
+        return ("CC", "SB")
+
+    return tuple(dict.fromkeys(valid_roots))
 
 
-# Usa o novo nome, mas preserva compatibilidade com a variável antiga.
-LEGACY_CACHE_TTL_SECONDS = env_int("CACHE_TTL_SECONDS", 60)
+# Mantem compatibilidade com a variavel antiga CACHE_TTL_SECONDS.
+_legacy_cache_ttl = env_int("CACHE_TTL_SECONDS", 60)
 CACHE_TTL_SECONDS = env_int(
     "BARCHART_CACHE_TTL_SECONDS",
-    LEGACY_CACHE_TTL_SECONDS,
+    _legacy_cache_ttl,
 )
-SUPPORTED_ROOTS = env_list("SUPPORTED_ROOTS", "CC,SB")
+SUPPORTED_ROOTS = parse_supported_roots()
 
-
-# Cache simples em memória.
-# Se houver mais de uma instância no Render, cada instância terá seu cache.
+# Cache simples em memoria. Cada instancia do Render possui seu proprio cache.
 _cache: dict[str, tuple[float, pd.DataFrame]] = {}
 _cache_lock = threading.Lock()
 
+
+# -----------------------------------------------------------------------------
+# Aplicacao e rotas basicas
+# -----------------------------------------------------------------------------
 
 api = FastAPI(
     title="Futures API",
@@ -83,53 +125,13 @@ api = FastAPI(
 )
 
 
-def get_api_key() -> str:
-    return os.getenv("BARCHART_API_KEY", "").strip()
-
-
-def source_unavailable_exception() -> HTTPException:
-    """
-    Resposta temporária e amigável enquanto a chave oficial não foi liberada.
-
-    Mantemos HTTP 503 para o frontend diferenciar indisponibilidade da fonte
-    de uma resposta válida sem cotações.
-    """
-    return HTTPException(
-        status_code=503,
-        detail={
-            "code": "FUTURES_SOURCE_UNAVAILABLE",
-            "message": (
-                "Atualização de preços temporariamente indisponível."
-            ),
-            "description": (
-                "Estamos aguardando a liberação de acesso à fonte oficial "
-                "Barchart. Nenhum valor alternativo será exibido para "
-                "evitar divergências."
-            ),
-            "source": "Barchart OnDemand",
-            "temporary": True,
-            "retryable": False,
-        },
-        headers={
-            "Retry-After": "3600",
-        },
-    )
-
-
 @api.get("/")
 def read_root():
-    api_key_configured = bool(get_api_key())
-
     return {
         "status": "ok",
         "message": "API de futures está online",
         "source": "Barchart OnDemand",
-        "sourceStatus": (
-            "ready"
-            if api_key_configured
-            else "awaiting_credentials"
-        ),
-        "apiKeyConfigured": api_key_configured,
+        "apiKeyConfigured": bool(get_api_key()),
         "cacheTtlSeconds": CACHE_TTL_SECONDS,
         "supportedRoots": list(SUPPORTED_ROOTS),
         "endpoints": [
@@ -155,14 +157,41 @@ def ping_head():
     return Response(status_code=200)
 
 
-def number_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
+# -----------------------------------------------------------------------------
+# Funcoes compartilhadas
+# -----------------------------------------------------------------------------
 
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
+
+def get_api_key() -> str:
+    return os.getenv("BARCHART_API_KEY", "").strip()
+
+
+def source_unavailable_exception() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "code": "FUTURES_SOURCE_UNAVAILABLE",
+            "message": (
+                "A atualização automática de preços está "
+                "temporariamente indisponível."
+            ),
+            "description": (
+                "Estamos aguardando a liberação de acesso à fonte oficial "
+                "Barchart. Nenhum valor alternativo será exibido para "
+                "evitar divergências."
+            ),
+            "source": "Barchart OnDemand",
+            "temporary": True,
+            "retryable": False,
+        },
+        headers={
+            "Retry-After": "3600",
+        },
+    )
+
+
+def number_or_none(value: Any) -> float | None:
+    if value is None or pd.isna(value):
         return None
 
     try:
@@ -172,13 +201,7 @@ def number_or_none(value: Any) -> float | None:
 
 
 def integer_or_none(value: Any) -> int | None:
-    if value is None:
-        return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
+    if value is None or pd.isna(value):
         return None
 
     try:
@@ -189,16 +212,8 @@ def integer_or_none(value: Any) -> int | None:
 
 def first_not_none(*values: Any) -> Any:
     for value in values:
-        if value is None:
-            continue
-
-        try:
-            if pd.isna(value):
-                continue
-        except (TypeError, ValueError):
-            continue
-
-        return value
+        if value is not None and not pd.isna(value):
+            return value
 
     return None
 
@@ -220,6 +235,26 @@ def calculate_previous_price(
         return None
 
     return last - change
+
+
+def normalize_dataframe_for_json(
+    dataframe: pd.DataFrame,
+) -> pd.DataFrame:
+    normalized = dataframe.replace(
+        [float("inf"), float("-inf")],
+        pd.NA,
+    )
+
+    return (
+        normalized
+        .astype(object)
+        .where(pd.notna(normalized), None)
+    )
+
+
+# -----------------------------------------------------------------------------
+# Cache da API oficial
+# -----------------------------------------------------------------------------
 
 
 def get_cached_futures(root: str) -> pd.DataFrame | None:
@@ -257,22 +292,23 @@ def set_cached_futures(
         )
 
 
+# -----------------------------------------------------------------------------
+# API oficial Barchart OnDemand
+# -----------------------------------------------------------------------------
+
+
 def request_barchart(root: str) -> dict[str, Any]:
     api_key = get_api_key()
 
+    # A rota /futures ja faz a validacao amigavel. Esta verificacao protege
+    # chamadas internas diretas sem expor o nome da variavel ao consumidor.
     if not api_key:
-        # Proteção adicional para chamadas internas diretas.
-        # A rota /futures trata este caso antes de iniciar as consultas.
-        raise RuntimeError(
-            "Fonte Barchart ainda não configurada"
-        )
+        raise RuntimeError("Credencial oficial do Barchart indisponível")
 
     payload = {
         "apikey": api_key,
         # ^F solicita todos os contratos futuros do root.
-        # Exemplos: CC^F e SB^F.
         "symbols": f"{root}^F",
-        # Campos adicionais de interesse.
         "fields": "openInterest,previousClose",
     }
 
@@ -283,13 +319,11 @@ def request_barchart(root: str) -> dict[str, Any]:
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             response = requests.post(
-                BARCHART_URL,
+                BARCHART_API_URL,
                 data=payload,
                 headers={
                     "Accept": "application/json",
-                    "Content-Type": (
-                        "application/x-www-form-urlencoded"
-                    ),
+                    "Content-Type": "application/x-www-form-urlencoded",
                     "User-Agent": "futures-cc-sb-peccin/3.1",
                 },
                 timeout=REQUEST_TIMEOUT,
@@ -317,8 +351,7 @@ def request_barchart(root: str) -> dict[str, Any]:
 
             if attempt < MAX_ATTEMPTS:
                 logger.warning(
-                    "Timeout no Barchart para root=%s; "
-                    "tentativa %s/%s",
+                    "Timeout no Barchart para root=%s; tentativa %s/%s",
                     root,
                     attempt,
                     MAX_ATTEMPTS,
@@ -346,8 +379,7 @@ def request_barchart(root: str) -> dict[str, Any]:
                 continue
 
             raise RuntimeError(
-                "Falha de rede ao consultar o Barchart para "
-                f"{root}: {exc}"
+                f"Falha de rede ao consultar o Barchart para {root}: {exc}"
             ) from exc
 
     if response is None:
@@ -356,67 +388,47 @@ def request_barchart(root: str) -> dict[str, Any]:
             f"{root}: {last_error}"
         )
 
+    elapsed_ms = round((time.monotonic() - started_at) * 1000)
+
+    if response.status_code == 204:
+        raise RuntimeError(
+            f"Barchart nao retornou conteudo para o root {root}"
+        )
+
     try:
         body = response.json()
     except ValueError as exc:
-        logger.error(
-            "Barchart retornou resposta não JSON; root=%s; HTTP=%s",
-            root,
-            response.status_code,
-        )
+        preview = response.text[:200].replace("\n", " ")
+
         raise RuntimeError(
             "Barchart retornou conteúdo que não é JSON; "
-            f"root={root}; HTTP={response.status_code}"
+            f"root={root}; HTTP={response.status_code}; "
+            f"resposta={preview!r}"
         ) from exc
 
-    if not isinstance(body, dict):
-        raise RuntimeError(
-            "Barchart retornou um formato de resposta inesperado; "
-            f"root={root}; HTTP={response.status_code}"
-        )
-
     api_status = body.get("status") or {}
-
-    if not isinstance(api_status, dict):
-        api_status = {}
-
     api_code = api_status.get("code")
     api_message = api_status.get(
         "message",
-        "Mensagem não informada",
-    )
-    results = body.get("results") or []
-
-    elapsed_ms = round(
-        (time.monotonic() - started_at) * 1000
+        "Mensagem nao informada",
     )
 
     logger.info(
-        "Consulta Barchart concluída; root=%s; HTTP=%s; "
-        "apiCode=%s; contratos=%s; elapsedMs=%s",
+        "Consulta oficial concluida root=%s http=%s apiCode=%s "
+        "elapsedMs=%s",
         root,
         response.status_code,
         api_code,
-        len(results) if isinstance(results, list) else 0,
         elapsed_ms,
     )
 
-    http_success = 200 <= response.status_code < 300
-    api_success = str(api_code) == "200"
-
-    if not http_success or not api_success:
+    if response.status_code >= 400 or str(api_code) != "200":
         raise RuntimeError(
             "Barchart recusou a consulta; "
             f"root={root}; "
             f"HTTP={response.status_code}; "
             f"código={api_code}; "
             f"mensagem={api_message}"
-        )
-
-    if not isinstance(results, list):
-        raise RuntimeError(
-            "Barchart retornou results em formato inesperado; "
-            f"root={root}"
         )
 
     return body
@@ -432,10 +444,7 @@ def get_futures(
         cached = get_cached_futures(root)
 
         if cached is not None:
-            logger.info(
-                "Cache utilizado para root=%s",
-                root,
-            )
+            logger.info("Cache utilizado para root=%s", root)
             return cached
 
     body = request_barchart(root)
@@ -443,25 +452,17 @@ def get_futures(
 
     if not results:
         raise RuntimeError(
-            "Nenhum contrato futuro foi retornado para "
-            f"o root {root}"
+            f"Nenhum contrato futuro foi retornado para o root {root}"
         )
 
     rows: list[dict[str, Any]] = []
 
     for item in results:
-        if not isinstance(item, dict):
-            logger.warning(
-                "Registro ignorado por formato inválido; root=%s",
-                root,
-            )
-            continue
-
         contract = item.get("symbol")
 
         if not contract:
             logger.warning(
-                "Registro ignorado porque não possui symbol; root=%s",
+                "Registro ignorado porque nao possui symbol; root=%s",
                 root,
             )
             continue
@@ -486,16 +487,10 @@ def get_futures(
                 "Previous": calculate_previous_price(
                     last_price=last_price,
                     net_change=net_change,
-                    explicit_previous=item.get(
-                        "previousClose"
-                    ),
+                    explicit_previous=item.get("previousClose"),
                 ),
-                "Volume": integer_or_none(
-                    item.get("volume")
-                ),
-                "Open_Int": integer_or_none(
-                    open_interest
-                ),
+                "Volume": integer_or_none(item.get("volume")),
+                "Open_Int": integer_or_none(open_interest),
                 "Time": first_not_none(
                     item.get("tradeTimestamp"),
                     item.get("serverTimestamp"),
@@ -505,7 +500,7 @@ def get_futures(
 
     if not rows:
         raise RuntimeError(
-            "O Barchart respondeu, mas não retornou "
+            "O Barchart respondeu, mas nao retornou "
             f"contratos válidos para {root}"
         )
 
@@ -523,32 +518,289 @@ def get_futures(
         "Time",
     ]
 
-    dataframe = pd.DataFrame(
-        rows,
-        columns=output_columns,
-    )
+    dataframe = pd.DataFrame(rows, columns=output_columns)
+    set_cached_futures(root, dataframe)
 
-    set_cached_futures(
+    logger.info(
+        "Contratos oficiais normalizados root=%s rows=%s",
         root,
-        dataframe,
+        len(dataframe),
     )
 
     return dataframe.copy(deep=True)
 
 
-def normalize_dataframe(
-    dataframe: pd.DataFrame,
-) -> pd.DataFrame:
-    normalized = dataframe.replace(
-        [float("inf"), float("-inf")],
-        pd.NA,
+# -----------------------------------------------------------------------------
+# Diagnostico temporario do método antigo
+# -----------------------------------------------------------------------------
+
+
+def validate_diagnostic_access(
+    received_token: str | None,
+) -> None:
+    enabled = env_bool("ENABLE_LEGACY_DIAGNOSTIC", False)
+    expected_token = os.getenv(
+        "LEGACY_DIAGNOSTIC_TOKEN",
+        "",
+    ).strip()
+
+    # Responde 404 quando estiver desativado ou quando o token for invalido,
+    # evitando expor a existencia do endpoint.
+    if not enabled or not expected_token or not received_token:
+        raise HTTPException(status_code=404)
+
+    if not hmac.compare_digest(received_token, expected_token):
+        raise HTTPException(status_code=404)
+
+
+@api.get(
+    "/diagnostics/legacy-barchart",
+    include_in_schema=False,
+)
+def diagnose_legacy_barchart(
+    root: str = "CC",
+    x_diagnostic_token: str | None = Header(
+        default=None,
+        alias="X-Diagnostic-Token",
+    ),
+):
+    """
+    Testa, a partir da própria instância do Render, se o fluxo antigo voltou.
+
+    O diagnostico não resolve CAPTCHA, não executa JavaScript, não contorna
+    proteção anti-bot e nunca devolve o conteudo do XSRF-TOKEN.
+    """
+
+    validate_diagnostic_access(x_diagnostic_token)
+
+    root = root.strip().upper()
+
+    if root not in SUPPORTED_ROOTS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Root não permitido no diagnostico",
+                "supportedRoots": list(SUPPORTED_ROOTS),
+            },
+        )
+
+    page_url = LEGACY_BARCHART_PAGE_URL.format(root=root)
+
+    user_agent = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
 
-    return (
-        normalized
-        .astype(object)
-        .where(pd.notna(normalized), None)
-    )
+    page_headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "User-Agent": user_agent,
+    }
+
+    challenge_markers = [
+        "verify that you're not a robot",
+        "verify you are human",
+        "enable javascript",
+        "javascript is disabled",
+        "checking your browser",
+        "pardon our interruption",
+        "captcha",
+    ]
+
+    started_at = time.monotonic()
+
+    try:
+        with requests.Session() as session:
+            page_response = session.get(
+                page_url,
+                headers=page_headers,
+                timeout=LEGACY_REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
+
+            page_elapsed_ms = round(
+                (time.monotonic() - started_at) * 1000
+            )
+
+            cookies = session.cookies.get_dict()
+            body_lower = page_response.text.lower()
+
+            challenge_detected = any(
+                marker in body_lower
+                for marker in challenge_markers
+            )
+
+            xsrf_cookie = cookies.get("XSRF-TOKEN")
+            xsrf_present = bool(xsrf_cookie)
+
+            page_result = {
+                "httpStatus": page_response.status_code,
+                "contentType": page_response.headers.get("content-type"),
+                "elapsedMs": page_elapsed_ms,
+                "bodyLength": len(page_response.content),
+                "cookieNames": sorted(cookies.keys()),
+                "xsrfTokenPresent": xsrf_present,
+                "challengeDetected": challenge_detected,
+                "finalUrlHost": urlparse(page_response.url).hostname,
+            }
+
+            logger.info(
+                "Diagnostico legacy pagina root=%s http=%s xsrf=%s "
+                "challenge=%s elapsedMs=%s",
+                root,
+                page_response.status_code,
+                xsrf_present,
+                challenge_detected,
+                page_elapsed_ms,
+            )
+
+            # O proxy só é testado quando o site forneceu naturalmente o
+            # cookie e não há indício de desafio anti-bot.
+            if not xsrf_present or challenge_detected:
+                return {
+                    "diagnostic": "legacy-barchart",
+                    "executedFrom": "render-service",
+                    "root": root,
+                    "page": page_result,
+                    "proxy": {
+                        "attempted": False,
+                        "reason": (
+                            "XSRF-TOKEN ausente ou proteção anti-bot "
+                            "detectada"
+                        ),
+                    },
+                    "legacyUsable": False,
+                }
+
+            xsrf_token = unquote(unquote(xsrf_cookie))
+
+            proxy_headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": page_url,
+                "User-Agent": user_agent,
+                "X-XSRF-TOKEN": xsrf_token,
+            }
+
+            proxy_params = {
+                "fields": (
+                    "symbol,contractSymbol,lastPrice,priceChange,"
+                    "openPrice,highPrice,lowPrice,previousPrice,"
+                    "volume,openInterest,tradeTime"
+                ),
+                "list": "futures.contractInRoot",
+                "root": root,
+                "raw": "1",
+            }
+
+            proxy_started_at = time.monotonic()
+
+            proxy_response = session.get(
+                LEGACY_BARCHART_PROXY_URL,
+                params=proxy_params,
+                headers=proxy_headers,
+                timeout=LEGACY_REQUEST_TIMEOUT,
+            )
+
+            proxy_elapsed_ms = round(
+                (time.monotonic() - proxy_started_at) * 1000
+            )
+
+            json_valid = False
+            rows = 0
+            response_keys: list[str] = []
+            proxy_error: str | None = None
+
+            try:
+                proxy_body = proxy_response.json()
+                json_valid = True
+
+                if isinstance(proxy_body, dict):
+                    response_keys = sorted(proxy_body.keys())
+                    proxy_data = proxy_body.get("data")
+
+                    if isinstance(proxy_data, list):
+                        rows = len(proxy_data)
+
+            except ValueError:
+                proxy_error = "O proxy retornou conteúdo que não é JSON"
+
+            legacy_usable = (
+                proxy_response.status_code == 200
+                and json_valid
+                and rows > 0
+            )
+
+            logger.info(
+                "Diagnostico legacy proxy root=%s http=%s json=%s "
+                "rows=%s usable=%s elapsedMs=%s",
+                root,
+                proxy_response.status_code,
+                json_valid,
+                rows,
+                legacy_usable,
+                proxy_elapsed_ms,
+            )
+
+            return {
+                "diagnostic": "legacy-barchart",
+                "executedFrom": "render-service",
+                "root": root,
+                "page": page_result,
+                "proxy": {
+                    "attempted": True,
+                    "httpStatus": proxy_response.status_code,
+                    "contentType": proxy_response.headers.get(
+                        "content-type"
+                    ),
+                    "elapsedMs": proxy_elapsed_ms,
+                    "jsonValid": json_valid,
+                    "responseKeys": response_keys,
+                    "rows": rows,
+                    "error": proxy_error,
+                },
+                "legacyUsable": legacy_usable,
+            }
+
+    except requests.Timeout:
+        logger.warning(
+            "Timeout no diagnostico legacy para root=%s",
+            root,
+        )
+
+        return {
+            "diagnostic": "legacy-barchart",
+            "executedFrom": "render-service",
+            "root": root,
+            "legacyUsable": False,
+            "networkError": "Timeout ao acessar o Barchart",
+        }
+
+    except requests.RequestException as exc:
+        logger.warning(
+            "Falha de rede no diagnostico legacy para root=%s: %s",
+            root,
+            exc,
+        )
+
+        return {
+            "diagnostic": "legacy-barchart",
+            "executedFrom": "render-service",
+            "root": root,
+            "legacyUsable": False,
+            "networkError": "Falha de rede ao acessar o Barchart",
+        }
+
+
+# -----------------------------------------------------------------------------
+# Endpoint publico de contratos futuros
+# -----------------------------------------------------------------------------
 
 
 @api.get("/futures")
@@ -568,25 +820,15 @@ def read_futures(
     if not root_list:
         raise HTTPException(
             status_code=400,
-            detail={
-                "code": "INVALID_ROOTS",
-                "message": (
-                    "Informe pelo menos um root, "
-                    "por exemplo: CC,SB"
-                ),
-            },
+            detail=(
+                "Informe pelo menos um root, por exemplo: CC,SB"
+            ),
         )
 
-    if len(root_list) > MAX_ROOTS_PER_REQUEST:
+    if len(root_list) > 10:
         raise HTTPException(
             status_code=400,
-            detail={
-                "code": "ROOT_LIMIT_EXCEEDED",
-                "message": (
-                    "O limite e de "
-                    f"{MAX_ROOTS_PER_REQUEST} roots por requisição"
-                ),
-            },
+            detail="O limite é de 10 roots por requisição",
         )
 
     invalid_roots = [
@@ -599,7 +841,6 @@ def read_futures(
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "INVALID_ROOTS",
                 "message": "Foram informados roots inválidos",
                 "roots": invalid_roots,
             },
@@ -615,26 +856,18 @@ def read_futures(
         raise HTTPException(
             status_code=400,
             detail={
-                "code": "UNSUPPORTED_ROOTS",
-                "message": "Foram informados roots não suportados",
+                "message": "Root não suportado",
                 "roots": unsupported_roots,
                 "supportedRoots": list(SUPPORTED_ROOTS),
             },
         )
 
-    # Esta verificação precisa ocorrer antes do loop.
-    # Assim o 503 amigável não é capturado e transformado em 502.
     if not get_api_key():
-        logger.info(
-            "Consulta de futures bloqueada temporariamente: "
-            "BARCHART_API_KEY ainda não configurada; roots=%s",
-            ",".join(root_list),
-        )
         raise source_unavailable_exception()
 
     logger.info(
-        "Consulta de futures iniciada; roots=%s; refresh=%s",
-        ",".join(root_list),
+        "Consulta /futures roots=%s refresh=%s",
+        root_list,
         refresh,
     )
 
@@ -667,38 +900,28 @@ def read_futures(
         raise HTTPException(
             status_code=502,
             detail={
-                "code": "FUTURES_PROVIDER_ERROR",
                 "message": (
-                    "Falha ao consultar a fonte "
-                    "de contratos futuros"
+                    "Falha ao consultar a fonte de contratos futuros"
                 ),
                 "source": "Barchart OnDemand",
                 "errors": errors,
             },
         )
 
-    df_final = pd.concat(
-        frames,
-        ignore_index=True,
-    )
-    df_final = normalize_dataframe(df_final)
+    df_final = pd.concat(frames, ignore_index=True)
+    df_final = normalize_dataframe_for_json(df_final)
 
     return {
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "roots": root_list,
         "rows": len(df_final),
         "partial": bool(errors),
         "errors": errors,
-        "data": df_final.to_dict(
-            orient="records"
-        ),
+        "data": df_final.to_dict(orient="records"),
     }
 
 
-# O CORS envolve toda a aplicação,
-# inclusive as respostas de erro.
+# O CORS envolve toda a aplicacao, inclusive respostas de erro.
 app = CORSMiddleware(
     app=api,
     allow_origins=["*"],
