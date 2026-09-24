@@ -10,6 +10,13 @@ services:
     envVars:
       - key: BARCHART_API_KEY
         sync: false
-
-      - key: CACHE_TTL_SECONDS
+      - key: BARCHART_BRIDGE_TOKEN
+        sync: false
+      - key: BARCHART_BRIDGE_MAX_AGE_SECONDS
+        value: "900"
+      - key: BARCHART_CACHE_TTL_SECONDS
         value: "60"
+      - key: BARCHART_ENABLE_BRIDGE_FALLBACK
+        value: "true"
+      - key: SUPPORTED_ROOTS
+        value: "CC,SB"
