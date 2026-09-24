@@ -141,18 +141,55 @@ def clean_time(value: Any) -> str | int | float | None:
     return str(value)
 
 
+FUTURES_MONTH_CODES = "FGHJKMNQUVXZ"
+
+
+def normalize_contract(value: Any, root: str) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip().upper()
+    if not text:
+        return None
+
+    # The browser endpoint may return either a plain symbol (CCZ26) or a
+    # descriptive value containing the symbol. Extract only an outright
+    # futures contract and ignore cash rows such as CCY00.
+    pattern = re.compile(
+        rf"(?<![A-Z0-9]){re.escape(root)}([{FUTURES_MONTH_CODES}])(\d{{1,4}})(?![A-Z0-9])"
+    )
+    match = pattern.search(text)
+    if match is None:
+        return None
+
+    month_code, year_text = match.groups()
+
+    if len(year_text) == 1:
+        current_year = now_utc().year
+        candidate = (current_year // 10) * 10 + int(year_text)
+        if candidate < current_year - 2:
+            candidate += 10
+        year_suffix = f"{candidate % 100:02d}"
+    elif len(year_text) == 2:
+        year_suffix = year_text
+    elif len(year_text) == 4:
+        year_suffix = year_text[-2:]
+    else:
+        return None
+
+    return f"{root}{month_code}{year_suffix}"
+
+
 def normalize_row(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
 
     root = str(raw.get("Root", "")).strip().upper()
-    contract = str(raw.get("Contract", "")).strip().upper()
-
     if root not in SUPPORTED_ROOTS:
         return None
-    if not contract or not contract.startswith(root):
-        return None
-    if len(contract) > 32 or not re.fullmatch(r"[A-Z0-9*._-]+", contract):
+
+    contract = normalize_contract(raw.get("Contract"), root)
+    if contract is None:
         return None
 
     return {
@@ -465,28 +502,58 @@ def bridge_ingest(
     validate_bridge_token(x_bridge_token)
 
     if payload.get("source") != "Barchart Web":
-        raise HTTPException(status_code=400, detail="Invalid bridge source")
-
-    captured_at = parse_datetime(payload.get("capturedAt"))
-    if captured_at is None:
-        raise HTTPException(status_code=400, detail="Invalid capturedAt")
-
-    age = (now_utc() - captured_at).total_seconds()
-    if age < -300 or age > 3600:
-        raise HTTPException(status_code=400, detail="capturedAt outside accepted range")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_BRIDGE_SOURCE",
+                "message": "Invalid bridge source",
+            },
+        )
 
     raw_rows = payload.get("data")
-    if not isinstance(raw_rows, list) or not raw_rows or len(raw_rows) > 200:
-        raise HTTPException(status_code=400, detail="Invalid bridge data")
+    if not isinstance(raw_rows, list) or not raw_rows or len(raw_rows) > 500:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "INVALID_BRIDGE_DATA",
+                "message": "Bridge data must contain between 1 and 500 rows",
+                "receivedRows": len(raw_rows) if isinstance(raw_rows, list) else None,
+            },
+        )
 
     rows = [normalize_row(item) for item in raw_rows]
     clean_rows = [item for item in rows if item is not None]
     if not clean_rows:
-        raise HTTPException(status_code=400, detail="No valid futures rows")
+        examples = []
+        for item in raw_rows[:5]:
+            if isinstance(item, dict):
+                examples.append(
+                    {
+                        "Root": item.get("Root"),
+                        "Contract": item.get("Contract"),
+                    }
+                )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "NO_VALID_FUTURES_ROWS",
+                "message": "No valid CC/SB futures rows were received",
+                "receivedRows": len(raw_rows),
+                "examples": examples,
+            },
+        )
+
+    # Freshness is based on receipt time at the server. This avoids false
+    # rejections caused by a workstation clock or timezone configuration.
+    received_at = now_utc()
+    client_captured_at = parse_datetime(payload.get("capturedAt"))
 
     state = {
         "source": "Barchart Web",
-        "capturedAt": iso_utc(captured_at),
+        "capturedAt": iso_utc(received_at),
+        "clientCapturedAt": (
+            None if client_captured_at is None else iso_utc(client_captured_at)
+        ),
         "data": clean_rows,
     }
 
@@ -495,14 +562,16 @@ def bridge_ingest(
     persist_bridge_state(state)
 
     logger.info(
-        "Barchart browser bridge updated rows=%s roots=%s",
+        "Barchart browser bridge updated rows=%s roots=%s rejectedRows=%s",
         len(clean_rows),
         sorted({item["Root"] for item in clean_rows}),
+        len(raw_rows) - len(clean_rows),
     )
     return {
         "status": "ok",
         "capturedAt": state["capturedAt"],
         "rows": len(clean_rows),
+        "rejectedRows": len(raw_rows) - len(clean_rows),
         "roots": sorted({item["Root"] for item in clean_rows}),
     }
 
